@@ -1,7 +1,7 @@
 illumos-fuse
 ==================
 
-*Driver for FUSE on illumos (based on OpenSolaris fuse code)*
+*Driver for FUSE on illumos (based on OpenSolaris fuse code) + sshfs*
 
 build & install
 ===============
@@ -21,5 +21,5 @@ IPS Packaging:
 
 Build sshfs (assuming you have driver and library installed):
 ``` 
-# cd sshfs-fuse && configure && gmake install
+# cd sshfs-fuse && configure && make install
 ```
