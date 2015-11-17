@@ -1,0 +1,38 @@
+set name=pkg.fmri value=pkg:/library/libfuse@$(PKGVERS)
+set name=pkg.summary value="FUSE file system library"
+set name=info.classification value=org.opensolaris.category.2008:System/Libraries
+set name=variant.opensolaris.zone value=global value=nonglobal
+file usr/bin/amd64/fusermount path=usr/bin/amd64/fusermount owner=root \
+    group=bin mode=0755
+file usr/bin/amd64/fusermount.bin path=usr/bin/amd64/fusermount.bin owner=root \
+    group=bin mode=0755
+file usr/bin/fusermount path=usr/bin/fusermount owner=root group=bin mode=0755
+dir  path=usr/include/fuse owner=root group=bin mode=0755
+file usr/include/fuse/fuse.h path=usr/include/fuse/fuse.h owner=root group=bin \
+    mode=0755
+file usr/include/fuse/fuse_common.h path=usr/include/fuse/fuse_common.h \
+    owner=root group=bin mode=0755
+file usr/include/fuse/fuse_common_compat.h \
+    path=usr/include/fuse/fuse_common_compat.h owner=root group=bin mode=0755
+file usr/include/fuse/fuse_compat.h path=usr/include/fuse/fuse_compat.h \
+    owner=root group=bin mode=0755
+file usr/include/fuse/fuse_lowlevel.h path=usr/include/fuse/fuse_lowlevel.h \
+    owner=root group=bin mode=0755
+file usr/include/fuse/fuse_lowlevel_compat.h \
+    path=usr/include/fuse/fuse_lowlevel_compat.h owner=root group=bin mode=0755
+file usr/include/fuse/fuse_opt.h path=usr/include/fuse/fuse_opt.h owner=root \
+    group=bin mode=0755
+file usr/lib/amd64/libfuse.so.2.7.1 path=usr/lib/amd64/libfuse.so.2.7.1 \
+    owner=root group=bin mode=0755
+dir  path=usr/lib/fs/fuse owner=root group=bin mode=0755
+file usr/lib/fs/fuse/fusermount.bin path=usr/lib/fs/fuse/fusermount.bin \
+    owner=root group=bin mode=0755
+file usr/lib/fs/fuse/mount path=usr/lib/fs/fuse/mount owner=root group=bin \
+    mode=0755
+file usr/lib/fs/fuse/umount path=usr/lib/fs/fuse/umount owner=root group=bin \
+    mode=0755
+file usr/lib/libfuse.so.2.7.1 path=usr/lib/libfuse.so.2.7.1 owner=root \
+    group=bin mode=0755
+file usr/lib/pkgconfig/fuse.pc path=usr/lib/pkgconfig/fuse.pc owner=root \
+    group=bin mode=0755
+depend fmri=pkg:/system/file-system/fuse type=require

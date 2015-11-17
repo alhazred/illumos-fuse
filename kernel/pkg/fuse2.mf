@@ -1,0 +1,11 @@
+set name=pkg.fmri value=pkg:/system/file-system/fuse@$(PKGVERS)
+set name=pkg.summary value="FUSE file system"
+set name=pkg.description value="FUSE file system driver"
+set name=info.classification \
+    value="org.opensolaris.category.2008:System/File System"
+set name=variant.opensolaris.zone value=global value=nonglobal
+file usr/kernel/drv/amd64/fuse path=usr/kernel/drv/amd64/fuse owner=root \
+    group=sys mode=0755
+file usr/kernel/drv/fuse path=usr/kernel/drv/fuse group=sys owner=root mode=0755
+file usr/kernel/drv/fuse.conf path=usr/kernel/drv/fuse.conf group=sys owner=root mode=0755
+driver name=fuse devlink=type=ddi_pseudo;name=fuse\t\D perms="fuse 0666 root sys"
