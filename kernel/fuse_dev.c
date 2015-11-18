@@ -21,6 +21,8 @@
 /*
  * Copyright 2009 Sun Microsystems, Inc.  All rights reserved.
  * Use is subject to license terms.
+ *
+ * Portions Copyright 2012 Jean-Pierre Andre
  */
 
 /*
@@ -83,7 +85,7 @@ static struct cb_ops fuse_dev_cb_ops = {
 	fuse_dev_prop_op,
 	NULL,	/* streamtab struct; if not NULL, all above */
 		/* fields are ignored */
-	D_NEW | D_MP,	/* compatibility flags: see conf.h */
+	D_NEW | D_MP | D_64BIT | D_U64BIT,	/* compatibility flags: see conf.h */
 	CB_REV,	/* cb_ops revision number */
 	nodev,	/* no aread */
 	nodev	/* no awrite */
@@ -315,7 +317,7 @@ fuse_dev_read(dev_t dev, struct uio *uiop, cred_t *credp)
 		 * Check if there is enough room to copy all data from this
 		 * iovbuf
 		 */
-		if (uiop->uio_resid < msgp->ipdata.iovbuf[i].len) {
+		if ((size_t)uiop->uio_resid < msgp->ipdata.iovbuf[i].len) {
 			DTRACE_PROBE2(fuse_dev_read_err_no_space,
 			    char *, "Buffer too small for request data",
 			    fuse_session_t *, sep);
@@ -339,7 +341,8 @@ fuse_dev_read(dev_t dev, struct uio *uiop, cred_t *credp)
 static int
 fuse_ohead_audit(struct fuse_out_header *ohead, struct uio *uio)
 {
-	if (uio->uio_resid + sizeof (struct fuse_out_header) != ohead->len) {
+	if ((size_t)uio->uio_resid + sizeof (struct fuse_out_header)
+			!= ohead->len) {
 		DTRACE_PROBE3(fuse_ohead_audit_err_header,
 		    char *, "Invalid length in header",
 		    struct uio *, uio,
@@ -369,6 +372,7 @@ fuse_dev_write(dev_t dev, struct uio *uiop, cred_t *cred_p)
 	struct fuse_out_header *outh;
 	fuse_session_t *se_p;
 	fuse_msg_node_t *msg_p = NULL;
+	fuse_msg_node_t *msg_next;
 	minor_t ndx = getminor(dev);
 	struct fuse_iov *iovbuf;
 
@@ -414,8 +418,7 @@ fuse_dev_write(dev_t dev, struct uio *uiop, cred_t *cred_p)
 
 	/* Reset error before starting the search */
 	err = DDI_FAILURE;
-	for (msg_p = list_head(&(se_p->msg_list)); msg_p;
-	    msg_p = list_next(&(se_p->msg_list), msg_p)) {
+	for (msg_p = list_head(&(se_p->msg_list)); msg_p; ) {
 		if (msg_p->fmn_unique == outh->unique) {
 			if (msg_p->fmn_state == FUSE_MSG_STATE_READ) {
 				msg_p->fmn_state = FUSE_MSG_STATE_WRITE;
@@ -430,6 +433,24 @@ fuse_dev_write(dev_t dev, struct uio *uiop, cred_t *cred_p)
 				FUSE_SESSION_MUTEX_UNLOCK(se_p);
 				goto cleanup;
 			}
+			msg_p = list_next(&(se_p->msg_list), msg_p);
+		} else {
+			msg_next = list_next(&(se_p->msg_list), msg_p);
+			/*
+			 * if no callback handler is registered, and no
+			 * reply is expected, it is our responsibility 
+			 * to free up obsolete message nodes.
+			 */
+			if (!msg_p->frd_on_request_complete
+			    && msg_p->fmn_noreply) {
+				if (msg_p->fmn_unique < se_p->max_unique) {
+					list_remove(&(se_p->msg_list), msg_p);
+					fuse_free_msg(msg_p);
+				}
+				if (outh->unique > se_p->max_unique)
+					se_p->max_unique = outh->unique;
+			}
+			msg_p = msg_next;
 		}
 	}
 	FUSE_SESSION_MUTEX_UNLOCK(se_p);
@@ -442,7 +463,7 @@ fuse_dev_write(dev_t dev, struct uio *uiop, cred_t *cred_p)
 			iovbuf = &msg_p->opdata.iovbuf;
 
 			if (iovbuf->memsize &&
-			    iovbuf->memsize < uiop->uio_resid &&
+			    iovbuf->memsize < (size_t)uiop->uio_resid &&
 			    iovbuf->memflag == MEM_TYPE_KMEM) {
 				kmem_free(iovbuf->base, iovbuf->memsize);
 				iovbuf->memsize = 0;
@@ -452,7 +473,8 @@ fuse_dev_write(dev_t dev, struct uio *uiop, cred_t *cred_p)
 				fuse_buf_alloc(iovbuf, uiop->uio_resid);
 			}
 
-			iovbuf->len = min(iovbuf->memsize, uiop->uio_resid);
+			iovbuf->len = min(iovbuf->memsize,
+						(size_t)uiop->uio_resid);
 
 			/* Save the start and length of arguments */
 			msg_p->opdata.outdata = iovbuf->base;

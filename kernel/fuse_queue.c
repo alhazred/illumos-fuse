@@ -121,6 +121,7 @@ fuse_init_session(fuse_session_t *se)
 {
 	(void) mutex_init(&se->session_mutx, NULL, MUTEX_DEFAULT, NULL);
 	(void) sema_init(&se->session_sema, 0, NULL, SEMA_DRIVER, NULL);
+	mutex_init(&se->avl_mutx, NULL, MUTEX_DEFAULT, NULL);
 	list_create(&se->msg_list, sizeof (fuse_msg_node_t),
 	    offsetof(fuse_msg_node_t, fmn_link));
 	avl_create(&se->avl_cache, fuse_avl_compare,
@@ -132,6 +133,7 @@ fuse_init_session(fuse_session_t *se)
 void
 fuse_deinit_session(fuse_session_t *se)
 {
+	mutex_destroy(&se->avl_mutx);
 	sema_destroy(&se->session_sema);
 	mutex_destroy(&se->session_mutx);
 	list_destroy(&se->msg_list);
@@ -329,6 +331,12 @@ fuse_avl_compare(const void *x1, const void *x2)
 	 * validate with the remaining fields of a node
 	 */
 	if (new->facn_nodeid == FUSE_NULL_ID) {
+		/*
+		 * JPA This is awfully wrong : the tree is based on
+		 * nodeid's, it cannot help if the nodeid's are missing.
+		 * A second tree would be needed. For now, avoid this
+		 * situation and do a full scan instead.
+		 */
 		if (new->namelen == old->namelen &&
 		    new->par_nodeid == old->par_nodeid) {
 			/* Compare the names for a match */

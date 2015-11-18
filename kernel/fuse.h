@@ -52,11 +52,13 @@ extern "C" {
  */
 #define	CACHE_LIST_NO_CHECK 0
 #define	CACHE_LIST_CHECK 1
+#define	CACHE_CHECK_ONLY 2
 
 #define	FUSE_NULL_ID	0
 
 #define	FSIZE_UPDATED		0x1	/* File size modifed by write */
 #define	FSIZE_NOT_RELIABLE	0x2	/* Cached file size might be invalid */
+#define	FSIZE_UNSENT		0x4	/* File size update not started */
 
 #define	FUSE_FORCE_FH_RELEASE	0x1	/* force release of filehandle */
 
@@ -116,6 +118,7 @@ typedef struct fuse_vnode_data {
 #endif
 	size_t fsize;	/* temp place holder when file size gets modified */
 	int file_size_status; /* indicates if cached file size is valid */
+	offset_t offset; /* offset of (single) unsent page */
 
 	kmutex_t f_lock; /* serializes write/setattr requests */
 	long f_mapcnt;	/* mappings to file pages */
@@ -128,7 +131,7 @@ typedef struct fuse_vnode_data {
 } fuse_vnode_data_t;
 
 /* Get nodeid from the struct vnode */
-#define	VNODE_TO_NODEID(vp)	((struct fuse_vnode_data *)vp->v_data)->nodeid
+#define	VNODE_TO_NODEID(vp)	((struct fuse_vnode_data *)(vp)->v_data)->nodeid
 /*
  * Max number of pages that can be used in a single read request
  * (used in FreeBSD Fuse)

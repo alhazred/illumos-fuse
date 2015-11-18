@@ -51,9 +51,11 @@ typedef struct fuse_session
 	ksema_t		session_sema; /* devops read sleeps over it */
 	list_t		msg_list;  /* message awaiting service rests here */
 	avl_tree_t	avl_cache; /* nodeid used to track associated vnode */
+	kmutex_t	avl_mutx; /* serialize actions on avl_cache */
 	minor_t		minor; /* Minor number associated with this session */
 	uint32_t	state;
 	uint64_t	unique; /* msg id used between lib and kernel module */
+	uint64_t	max_unique;
 	cred_t		*usercred;  /* Credentials passed by fuse library */
 	uint32_t	max_write;  /* Max Write value set by fuse lib */
 	vfs_t		*vfs;
@@ -109,6 +111,7 @@ struct fuse_msg_node
 	kcondvar_t	fmn_cv;
 	kmutex_t	fmn_mutx;
 	int		fmn_state;
+	int		fmn_noreply; /* no reply expected */
 	uint64_t	fmn_unique;  /* identifies a unique message */
 	/* Message interchange struct between FUSE Kernel and FUSE lib. */
 	fuse_req_data_t	fmn_req;
@@ -131,6 +134,7 @@ fuse_avl_cache_node_t *fuse_avl_cache_node_create(vnode_t *np, uint64_t inode,
     uint64_t par_nodeid, unsigned short namelen, char *name);
 fuse_msg_node_t *fuse_setup_message(size_t argsize, enum fuse_opcode op,
     uint64_t nodeid, cred_t *credp, uint64_t unique);
+void fuse_destroy_cache(fuse_session_t *sep);
 
 #ifdef	__cplusplus
 }

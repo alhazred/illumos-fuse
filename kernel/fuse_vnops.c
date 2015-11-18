@@ -25,6 +25,8 @@
 /*
  * Copyright 2009 Sun Microsystems, Inc.  All rights reserved.
  * Use is subject to license terms.
+ *
+ * Portions Copyright 2012 Jean-Pierre Andre
  */
 /*
  * This file has been derived from OpenSolaris devfs and others in uts/common/fs
@@ -107,13 +109,18 @@ static int fuse_symlink(vnode_t *dvp, char *name, vattr_t *vap, char *link,
     cred_t *cr, caller_context_t *ct, int flags);
 static int fuse_readlink(vnode_t *vp, uio_t *uio, cred_t *cr,
     caller_context_t *ct);
+static int fuse_mkfifo(struct vnode *dvp, char *nm, struct vattr *vap,
+    vcexcl_t excl, int mode, struct vnode **vpp, struct cred *cred,
+    int flag, caller_context_t *ct, vsecattr_t *vsecp);
 static int fuse_space(vnode_t *vp, int cmd, struct flock64 *bfp, int flag,
     offset_t off, cred_t *cr, caller_context_t *ct);
 static int fuse_getpage(struct vnode *vp, offset_t off, size_t len,
     uint_t *protp, page_t *pl[], size_t plsz, struct seg *seg, caddr_t addr,
     enum seg_rw rw, struct cred *credp, caller_context_t *ct);
 static int fuse_putpage(struct vnode *vp, offset_t off, size_t len, int flags,
-	struct cred *credp, caller_context_t *ct);
+    struct cred *credp, caller_context_t *ct);
+static int fuse_putapage(vnode_t *vp, page_t *pp, u_offset_t *offp,
+    size_t *lenp, int flags, cred_t *credp);
 static int fuse_map(vnode_t *, offset_t, struct as *, caddr_t *, size_t,
     uchar_t, uchar_t, uint_t, cred_t *, caller_context_t *);
 static int fuse_addmap(vnode_t *, offset_t, struct as *, caddr_t,  size_t,
@@ -213,6 +220,31 @@ _NOTE(CONSTCOND) } while (0)
 #define	invalidate_cached_attrs(vp)					\
 	if (VTOFD(vp))							\
 	    bzero(&(VTOFD(vp)->cached_attrs_bound), sizeof (timestruc_t));
+
+/*
+ *		Scan the avl-tree for a file whose nodeid in unknown
+ *
+ *	The tree is based on nodeid's, so avl_find() cannot help
+ *
+ *	All actions on the avl_tree must be serialized by avl_mutx
+ */
+
+static fuse_avl_cache_node_t *avl_scan(avl_tree_t *tree,
+					fuse_avl_cache_node_t *tofind)
+{
+	fuse_avl_cache_node_t *record;
+
+	record = (fuse_avl_cache_node_t*)avl_first(tree);
+	while (record
+	    && ((record->namelen != tofind->namelen)
+		|| (record->par_nodeid != tofind->par_nodeid)
+		|| strncmp(record->name, tofind->name, tofind->namelen))) {
+			record = AVL_NEXT(tree, record);
+		}
+	if (record && !record->facn_vnode_p)
+		record = NULL;
+	return (record);
+}
 
 /* Function which allocates the requested amount of size for message passing */
 void
@@ -442,8 +474,10 @@ resp_intrprt:
 
 	/* Check if there will be a collision? */
 	tofind.facn_nodeid = feo->nodeid;
-	if ((foundp = avl_find(&(sep->avl_cache), &tofind,
-	    &where)) != NULL) {
+	mutex_enter(&sep->avl_mutx);
+	foundp = avl_find(&(sep->avl_cache), &tofind, &where);
+	mutex_exit(&sep->avl_mutx);
+	if (foundp) {
 		DTRACE_PROBE2(create_filehandle_err_collision,
 		    char *, "Node already in cache",
 		    struct fuse_entry_out *, feo);
@@ -456,7 +490,9 @@ resp_intrprt:
 	/* Add the vnode to the avl tree */
 	cache_nodep = fuse_avl_cache_node_create(vp, feo->nodeid,
 	    fvdata->fcd->par_nodeid, fvdata->fcd->namelen, fvdata->fcd->name);
+	mutex_enter(&sep->avl_mutx);
 	avl_add(&(sep->avl_cache), cache_nodep);
+	mutex_exit(&sep->avl_mutx);
 
 	release_create_data(fvdata->fcd);
 	fvdata->fcd = NULL;
@@ -537,8 +573,8 @@ fuse_release_fh(struct fuse_file_handle *fhp, struct fuse_fh_param *param)
 static int
 fuse_std_filecheck(struct fuse_file_handle *fhp, struct fuse_fh_param *param)
 {
-	if (((param->rw_mode & (FREAD | FWRITE | FAPPEND)) &
-	    (fhp->mode & (FREAD | FWRITE | FAPPEND))) &&
+	if ((param->rw_mode & fhp->mode
+			 & (FREAD | FWRITE | FAPPEND | FCREAT)) &&
 	    crgetuid(param->credp) == crgetuid(fhp->credp) &&
 	    crgetgid(param->credp) == crgetgid(fhp->credp) &&
 	    curproc->p_pidp->pid_id == fhp->process_id) {
@@ -602,6 +638,10 @@ get_filehandle(struct vnode *vp, int flag, struct cred *credp,
 			DTRACE_PROBE3(get_filehandle_err_create,
 			    char *, "create_filehandle request failed",
 			    int, err, struct vnode *, vp);
+			/* release the vnode, if creation failed */
+			VFS_RELE(vp->v_vfsp);
+			vp->v_data = NULL;
+			vn_free(vp);
 			goto out;
 		} else if (msgp && msgp->opdata.outdata) {
 			DTRACE_PROBE2(get_filehandle_info_create_ok,
@@ -614,6 +654,13 @@ get_filehandle(struct vnode *vp, int flag, struct cred *credp,
 		fh_param.credp = credp;
 		fh_param.rw_mode = flag;
 		fh_param.fufh = NULL;
+		if (!VTOFD(vp)) {
+			/*
+			 * Very bad : do not panic.
+			 */
+			err = ENODEV;
+			goto out;
+		}
 		/*
 		 * Check if we already have retrieved the file handle
 		 * from user space before
@@ -621,6 +668,10 @@ get_filehandle(struct vnode *vp, int flag, struct cred *credp,
 		if (iterate_filehandle(vp, fuse_std_filecheck, &fh_param,
 		    fufhpp))
 			goto out;
+		if (check_cache & CACHE_CHECK_ONLY) {
+			err = ENOENT;
+			goto out;
+		}
 	}
 	/*
 	 * Allocate a new message node only if create_filehandle wasn't able
@@ -669,7 +720,7 @@ resp_intrprt:
 	fhp->fh_id = foout->fh;
 	fhp->flags = foout->open_flags;
 
-	fhp->mode = flag & ~(O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC);
+	fhp->mode = flag & ~(O_EXCL | O_NOCTTY | O_TRUNC);
 	crhold(credp);
 	fhp->credp = credp;
 	fhp->ref = 1;
@@ -703,12 +754,36 @@ static int fuse_open(struct vnode **vpp, int flag, struct cred *cred_p,
 	struct vnode *vp = *vpp;
 	int err = 0;
 
+	/* Bounce the openings of special devices */
+	if (vp && (vp->v_type == VFIFO)) {
+		vnode_t	*svp;
+
+		svp = specvp(vp, vp->v_rdev, vp->v_type, cred_p);
+		VN_RELE(vp);
+		if (svp == NULL)
+			err = ENOSYS;
+		else
+			*vpp = svp;
+		if (!err)
+			err = VOP_OPEN(vpp, flag, cred_p, ct);
+		return (err);
+	}
+
 	if ((err = get_filehandle(vp, flag, cred_p, NULL,
 	    CACHE_LIST_NO_CHECK))) {
 		DTRACE_PROBE2(fuse_open_err_filehandle,
 		    char *, "get_filehandle failed",
 		    struct vnode *, vp);
 		goto out;
+	}
+
+	if ((flag & (FWRITE | FTRUNC | FAPPEND)) == (FWRITE | FTRUNC)) {
+		vattr_t va;
+		int err;
+
+		va.va_mask = AT_SIZE;
+		va.va_size = 0;
+		err = VOP_SETATTR(vp, &va, 0, cred_p, ct);
 	}
 
 	/*
@@ -753,6 +828,66 @@ cleanup:
 	return (err);
 }
 
+/*
+ *		Discard a file name
+ *
+ * If the file was open, and it does not have any names left,
+ * the file will be deleted later, when it is not open any more.
+ * Just remove its name from the cache, so that the cached entry
+ * will be deleted when the file is closed.
+ */
+
+static int fuse_discard_name(struct vnode *vp, fuse_session_t *sep)
+{
+	fuse_avl_cache_node_t find, *unnamep;
+
+	if ((vp->v_type != VREG)
+	    || (!vp->v_rdcnt && !vp->v_wrcnt)) {
+		VN_RELE(vp);
+		fuse_vnode_free(vp, sep);
+	} else {
+		find.facn_nodeid = VNODE_TO_NODEID(vp);
+		mutex_enter(&sep->avl_mutx);
+		unnamep = avl_find(&(sep->avl_cache), &find, NULL);
+		if (unnamep) {
+			char *oldname = unnamep->name;
+			int oldnamelen = unnamep->namelen;
+
+			avl_remove(&(sep->avl_cache), unnamep);
+			unnamep->name = "";
+			unnamep->namelen = 0;
+			avl_add(&(sep->avl_cache), unnamep);
+			mutex_exit(&sep->avl_mutx);
+			kmem_free(oldname, oldnamelen);
+		} else
+			mutex_exit(&sep->avl_mutx);
+		VN_RELE(vp);
+	}
+	return (0);
+}
+
+/*
+ *		Flush any unsent data not sent to putpage()
+ *
+ *	This is required at close() and truncate()
+ */
+
+static int flush_unsent_data(struct vnode *vp, struct cred *credp,
+					caller_context_t *ct)
+{
+	fuse_vnode_data_t *vdata;
+	int err;
+
+	err = 0;
+	vdata = (fuse_vnode_data_t*)vp->v_data;
+	if (vdata && (vdata->file_size_status & FSIZE_UNSENT)) {
+		vdata->file_size_status &= ~FSIZE_UNSENT;
+		err = VOP_PUTPAGE(vp, vdata->offset,
+			(size_t)0, 0, credp, ct);
+	}
+	return (err);
+}
+
 /* ARGSUSED */
 static int fuse_close(struct vnode *vp, int flags, int count,
     offset_t offset, struct cred *credp, caller_context_t *ct)
@@ -764,6 +899,13 @@ static int fuse_close(struct vnode *vp, int flags, int count,
 	enum fuse_opcode op = (vp->v_type == VDIR) ?
 	    FUSE_RELEASEDIR : FUSE_RELEASE;
 
+		/* First, send unsent data */
+	if (vp && vp->v_data) {
+		err = flush_unsent_data(vp, credp, ct);
+		if (err)
+			return (err);
+	}
+
 	sep = fuse_minor_get_session(getminor(vp->v_rdev));
 	if (sep == NULL) {
 		DTRACE_PROBE2(fuse_close_err_session,
@@ -772,10 +914,18 @@ static int fuse_close(struct vnode *vp, int flags, int count,
 		return (ENODEV);
 	}
 
-	if ((err = get_filehandle(vp, flags, credp, &fhp, CACHE_LIST_CHECK))) {
+	/*
+	 * JPA Only check within the cache, if not referenced in the
+	 * cache, there is nothing to do.
+	 * This happens in obscure circumstances related to "rm -rf"
+	 */
+	if ((err = get_filehandle(vp, flags, credp, &fhp,
+				CACHE_LIST_CHECK | CACHE_CHECK_ONLY))) {
 		DTRACE_PROBE2(fuse_close_err_filehandle,
 		    char *, "get_filehandle failed",
 		    struct vnode *, vp);
+		if (err == ENOENT)
+			err = 0;
 		goto cleanup;
 	}
 
@@ -792,6 +942,24 @@ static int fuse_close(struct vnode *vp, int flags, int count,
 
 		err = fuse_send_release(sep, fhp, op, vp, flags);
 		kmem_free(fhp, sizeof (*fhp));
+	}
+	/*
+	 * If the file is not open any more (is this the same as having
+	 * a ref count of 1 above ?), check whether deleting the file
+	 * has been requested while it was open.
+	 * If so, release the file so that it becomes inactive and
+	 * can be deleted.
+	 */
+	if ((vp->v_type != VDIR) && ((vp->v_rdcnt + vp->v_wrcnt) == 1)) {
+		fuse_avl_cache_node_t find, *closep;
+
+		find.facn_nodeid = VNODE_TO_NODEID(vp);
+		mutex_enter(&sep->avl_mutx);
+		closep = avl_find(&(sep->avl_cache), &find, NULL);
+		mutex_exit(&sep->avl_mutx);
+		if (closep && !closep->namelen) {
+			VN_RELE(vp);
+		}
 	}
 cleanup:
 	return (err);
@@ -1015,7 +1183,7 @@ rdfuse(struct vnode *vp, struct uio *uiop, struct cred *credp)
 		/* Calculate offset within a page that must be read */
 		off = uiop->uio_loffset;
 		pageoffset = off & PAGEOFFSET;
-		len = MIN(PAGESIZE - pageoffset, uiop->uio_resid);
+		len = MIN(PAGESIZE - pageoffset, (size_t)uiop->uio_resid);
 
 		/* Check if we are crossing end of file */
 		diff = fsize - off;
@@ -1047,7 +1215,7 @@ rdfuse(struct vnode *vp, struct uio *uiop, struct cred *credp)
 			(void) segmap_release(segkmap, base, 0);
 	} while (err == 0 && uiop->uio_resid > 0);
 
-	if (uiop->uio_resid != req_len)
+	if ((ulong_t)uiop->uio_resid != req_len)
 		err = 0;
 
 	return (err);
@@ -1070,6 +1238,8 @@ wrfuse(struct vnode *vp, struct uio *uiop, int ioflag,
 	caddr_t base;		/* base of segmap */
 	ssize_t bytes;
 	int err;
+	offset_t unsent_offset; /* offset of a single unsent page */
+	fuse_vnode_data_t *vdata;
 	int pagecreate, newpage;
 	ssize_t premove_resid;
 	uint_t flags;
@@ -1083,7 +1253,23 @@ wrfuse(struct vnode *vp, struct uio *uiop, int ioflag,
 	if (limit == RLIM64_INFINITY || limit > MAXOFFSET_T)
 		limit = MAXOFFSET_T;
 
-	if (uiop->uio_loffset >= limit) {
+	unsent_offset = start_off & PAGEMASK;
+		/*
+		 * If there is unsent data in a page not covered by
+		 * the current write, sent it first.
+		 * Maybe this is not needed (depends on the meaning
+		 * of offset in putpage()), anyway it is safer.
+		 */
+	vdata = (fuse_vnode_data_t*)vp->v_data;
+	if (vdata && (vdata->file_size_status & FSIZE_UNSENT)) {
+		if ((vdata->offset < (offset_t)(uiop->uio_loffset & PAGEMASK))
+		   || (vdata->offset
+			> (offset_t)((uiop->uio_loffset + uiop->uio_resid - 1)
+					& PAGEMASK)))
+			flush_unsent_data(vp, credp, ct);
+		vdata->file_size_status &= ~FSIZE_UNSENT;
+	}
+	if ((rlim64_t)uiop->uio_loffset >= limit) {
 		proc_t *p = ttoproc(curthread);
 
 		mutex_enter(&p->p_lock);
@@ -1111,7 +1297,7 @@ wrfuse(struct vnode *vp, struct uio *uiop, int ioflag,
 	do {
 		uoff = uiop->uio_offset;
 		pageoff = uoff & (u_offset_t)PAGEOFFSET;
-		bytes = MIN(PAGESIZE - pageoff, uiop->uio_resid);
+		bytes = MIN(PAGESIZE - pageoff, (size_t)uiop->uio_resid);
 
 		if (uoff + bytes >= limit) {
 			if (uoff >= limit) {
@@ -1127,8 +1313,8 @@ wrfuse(struct vnode *vp, struct uio *uiop, int ioflag,
 		 * 2. When the file is yet to be written to or of zero size.
 		 * 3. When we are extending the file from a new page
 		 */
-		pagecreate = (bytes == PAGESIZE) | (fsize == 0) |
-		    ((pageoff == 0) && (fsize <= uiop->uio_offset));
+		pagecreate = (bytes == (ssize_t)PAGESIZE) | (fsize == 0) |
+		    ((pageoff == 0) && (fsize <= (u_offset_t)uiop->uio_offset));
 
 		if (uoff + bytes > fsize) {
 			file_size_change = 1;
@@ -1138,9 +1324,29 @@ wrfuse(struct vnode *vp, struct uio *uiop, int ioflag,
 		premove_resid = uiop->uio_resid;
 
 		if (vpm_enable) {
-			err = vpm_data_copy(vp, uoff, bytes, uiop, !pagecreate,
-			    &newpage, 0, S_WRITE);
+				/*
+				 * If we are about to copy a partial page
+				 * and there are ready pages, flush them now
+				 */
+			if ((unsent_offset < 0)
+			    && ((uoff + bytes) & PAGEOFFSET)) {
+				err = VOP_PUTPAGE(vp, (offset_t)(start_off & PAGEMASK),
+				    (size_t)0, 0, credp, ct);
+				/* next page need not be sent */
+				unsent_offset = (uoff + bytes) & PAGEMASK;
+			}
+				/* copy the page, unless we go an error */
+			if (!err) {
+				err = vpm_data_copy(vp, uoff, bytes, uiop,
+					    !pagecreate, &newpage,
+					    pagecreate && pageoff, S_WRITE);
+				/* flush if this is a full page */
+				if (!((uoff + bytes) & PAGEOFFSET)) {
+					unsent_offset = -1;
+				}
+			}
 		} else {
+			unsent_offset = -1;
 			segmap_offset = (uoff & PAGEMASK) & MAXBOFFSET;
 			base = segmap_getmapflt(segkmap, vp,
 			    uoff & MAXBMASK, PAGESIZE, !pagecreate, S_WRITE);
@@ -1169,7 +1375,7 @@ wrfuse(struct vnode *vp, struct uio *uiop, int ioflag,
 			 * write valid data.
 			 */
 			if (pagecreate &&
-			    uiop->uio_offset < P2ROUNDUP(uoff + bytes,
+			    (size_t)uiop->uio_offset < P2ROUNDUP(uoff + bytes,
 			    PAGESIZE)) {
 				long zoffset;
 				long nmoved;
@@ -1177,7 +1383,8 @@ wrfuse(struct vnode *vp, struct uio *uiop, int ioflag,
 				nmoved = uiop->uio_offset - uoff;
 				ASSERT((nmoved + pageoff) <= PAGESIZE);
 
-				if ((zoffset = pageoff + nmoved) < PAGESIZE)
+				if ((size_t)(zoffset = pageoff + nmoved)
+							< PAGESIZE)
 					(void) kzero(
 					    base + segmap_offset + zoffset,
 					    (size_t)PAGESIZE - zoffset);
@@ -1261,10 +1468,16 @@ wrfuse(struct vnode *vp, struct uio *uiop, int ioflag,
 		}
 	} while (uiop->uio_resid > 0 && err == 0 && bytes != 0);
 out:
-	/* if we did write any data, then try flushing it out to daemon */
+	/* if we did write any data, then flush it out to daemon if needed */
 	if (start_resid != uiop->uio_resid) {
-		err = VOP_PUTPAGE(vp, (offset_t)(start_off & PAGEMASK),
-		    (size_t)0, 0, credp, ct);
+		if (unsent_offset < 0)
+			err = VOP_PUTPAGE(vp, (offset_t)(start_off & PAGEMASK),
+			    (size_t)0, 0, credp, ct);
+		else {
+			VTOFD(vp)->offset = unsent_offset;
+			fsize_change_notify(vp, fsize,
+					FSIZE_UNSENT | FSIZE_UPDATED);
+		}
 	}
 
 	return (err);
@@ -1296,7 +1509,11 @@ static void fuse_set_getattr(struct vnode *vp, struct vattr *vap,
     struct fuse_attr *attr)
 {
 	vap->va_mode = attr->mode & MODEMASK;
-	vap->va_size = attr->size;
+		/* return cached size if some data were not flushed */
+	if (vp->v_data && (VTOFD(vp)->file_size_status & FSIZE_UPDATED))
+		vap->va_size = VTOFD(vp)->fsize;
+	else
+		vap->va_size = attr->size;
 	vap->va_atime.tv_sec = attr->atime;
 	vap->va_atime.tv_nsec = attr->atimensec;
 	vap->va_mtime.tv_sec = attr->mtime;
@@ -1310,13 +1527,13 @@ static void fuse_set_getattr(struct vnode *vp, struct vattr *vap,
 
 	vap->va_mask = AT_ALL;
 	vap->va_type = vp->v_type;
-	vap->va_nodeid = VNODE_TO_NODEID(vp);
+	/* return the file system ino, not the fuse internal nodeid */
+	vap->va_nodeid = attr->ino;
 
 	vap->va_rdev = vp->v_rdev;
 	vap->va_blksize = vp->v_vfsp->vfs_bsize;
-#define	howmany(x, y)	(((x)+((y)-1))/(y))
 
-	vap->va_nblocks = howmany(vap->va_size, vap->va_blksize);
+	vap->va_nblocks = attr->blocks;
 	/* TBD: What value should we set here ? */
 	vap->va_seq = 0;
 	vap->va_fsid = vp->v_vfsp->vfs_dev;
@@ -1436,11 +1653,13 @@ fuse_setattr(
 	int err = 0;
 	fuse_msg_node_t *msgp;
 	struct fuse_setattr_in *fsai;
+	struct fuse_file_handle *fhp;
 	struct vattr va;
 	enum vtype vtyp;
 	long int mask = vap->va_mask;
 	fuse_session_t *sep;
 
+	fhp = (struct fuse_file_handle*)NULL;
 	sep = fuse_minor_get_session(getminor(vp->v_rdev));
 	if (sep == NULL) {
 		DTRACE_PROBE2(fuse_setattr_err_session,
@@ -1452,6 +1671,29 @@ fuse_setattr(
 	/* Check for unsettable attributes */
 	if (mask & AT_NOSET)
 		return (EINVAL);
+
+	if (mask & AT_SIZE) {
+			/*
+			 * Write unsent data before truncating, only
+			 * needed for data visible after the truncation
+			 */
+		if (vap->va_size) {
+			err = flush_unsent_data(vp, credp, ct);
+			if (err)
+				return (err);
+		}
+		if (vp->v_data)
+			fsize_change_notify(vp, 0, FSIZE_NOT_RELIABLE);
+			/*
+			 * Mark all pages beyond the truncation as invalid
+			 * otherwise old data may show in holes which
+			 * are left in rewritten parts.
+			 * Actually we cannot find pages beyond the
+			 * truncation, so we invalidate them all.
+			 */
+		if (vn_has_cached_data(vp))
+			pvn_vplist_dirty(vp, 0, fuse_putapage, B_INVAL, credp);
+	}
 
 	mutex_enter(&VTOFD(vp)->f_lock);
 
@@ -1508,13 +1750,36 @@ fuse_setattr(
 	}
 
 	if (mask & AT_SIZE) {
+		struct fuse_fh_param  fh_param;
+
 		fsai->FUSEATTR(size) = vap->va_size;
 		fsai->valid |= FATTR_SIZE;
+		/*
+		 * For ftruncate() we must provide the file system with
+		 * its file handle.
+		 * We cannot tell whether truncate() or ftruncate()
+		 * was used, we can only check whether the calling
+		 * process has a create handle on the file.
+		 */
+		fh_param.credp = credp;
+		fh_param.rw_mode = FCREAT;
+		fh_param.fufh = NULL;
+		if (vp->v_wrcnt
+		   && (iterate_filehandle(vp, fuse_std_filecheck, &fh_param,
+								&fhp))) {
+			fsai->fh = fhp->fh_id;
+			fsai->valid |= FATTR_FH;
+		} else
+			fhp = (struct fuse_file_handle*)NULL;
 	}
 	/* if we received a signal or daemon replied with an error */
 	if ((err = fuse_queue_request_wait(sep, msgp)) != 0) {
+		if (fhp)
+			fhp->ref--;
 		goto cleanup;
 	}
+	if (fhp)
+		fhp->ref--;
 	if ((err = msgp->opdata.fouth->error) != 0) {
 		DTRACE_PROBE2(fuse_setattr_err_setattr_req,
 		    char *, "FUSE_SETATTR request failed",
@@ -1561,6 +1826,7 @@ fuse_link(struct vnode *dvp, struct vnode *srcvp, char *tnm,
 	struct fuse_entry_out *feo;
 	fuse_msg_node_t *msgp;
 	char *name;
+	struct vnode *vp;
 	fuse_session_t *sep;
 	int err = DDI_SUCCESS;
 	int nmlen = strlen(tnm) + 1;
@@ -1571,6 +1837,16 @@ fuse_link(struct vnode *dvp, struct vnode *srcvp, char *tnm,
 		    char *, "failed to find session",
 		    struct vnode *, dvp);
 		return (ENODEV);
+	}
+	/* Directories cannot be linked */
+	if (srcvp->v_type == VDIR)
+		return (EPERM);
+
+	/* Make sure the target does not exist */
+	err = fuse_lookup_i(dvp, tnm, &vp, credp);
+	if (!err && vp) {
+		VN_RELE(vp);
+		return (EEXIST);
 	}
 
 	msgp = fuse_setup_message(sizeof (*fli) + nmlen, FUSE_LINK,
@@ -1675,13 +1951,36 @@ fuse_access_i(void *vvp, int mode, struct cred *credp)
 			fai->mask |= W_OK;
 		if (mode & VEXEC)
 			fai->mask |= X_OK;
+		/*
+		 * Do not request a check from the file system if the
+		 * file is being created by the current process.
+		 * This is a workaround needed to allow ftruncate()
+		 * for the process having a write descriptor to the file
+		 * it is currently creating as read-only.
+		 */
+		if ((mode & VWRITE) && vp->v_wrcnt) {
+			struct fuse_fh_param fh_param;
+			struct fuse_file_handle *fhp;
+
+			fh_param.credp = credp;
+			fh_param.rw_mode = FCREAT;
+			fh_param.fufh = NULL;
+			if (vp->v_wrcnt
+			   && (iterate_filehandle(vp, fuse_std_filecheck,
+						&fh_param, &fhp))) {
+				fhp->ref--;
+				fai->mask &= ~W_OK;
+			}
+		}
 
 		/*
 		 * queue the message for sending to userland filesystem
-		 * lib framework
+		 * lib framework, unless there is nothing to check
 		 */
-		err = fuse_queue_request_wait(sep, msgp);
-		if (!(err)) {
+
+		if (fai->mask)
+			err = fuse_queue_request_wait(sep, msgp);
+		if (fai->mask && !err) {
 			/*
 			 * We got woken up, so fuse library has replied to
 			 * our request
@@ -1916,8 +2215,16 @@ fuse_getvnode(uint64_t nodeid, struct vnode **vpp, v_getmode vmode,
 	int create_new = 0;
 
 	tofind.facn_nodeid = nodeid;
-	if ((foundp = avl_find(&(sep->avl_cache), &tofind,
-	    NULL)) != NULL) {
+	tofind.namelen = namelen;
+	tofind.name = name;
+	tofind.par_nodeid = parent_nid;
+	mutex_enter(&sep->avl_mutx);
+	if (nodeid == FUSE_NULL_ID)
+		foundp = avl_scan(&(sep->avl_cache), &tofind);
+	else
+		foundp = avl_find(&(sep->avl_cache), &tofind, NULL);
+	mutex_exit(&sep->avl_mutx);
+	if (foundp) {
 		*vpp = foundp->facn_vnode_p;
 		ASSERT(*vpp);
 		/*
@@ -1949,7 +2256,9 @@ fuse_getvnode(uint64_t nodeid, struct vnode **vpp, v_getmode vmode,
 
 		avl_nodep = fuse_avl_cache_node_create(
 		    *vpp, nodeid, parent_nid, namelen, name);
+		mutex_enter(&sep->avl_mutx);
 		avl_add(&(sep->avl_cache), avl_nodep);
+		mutex_exit(&sep->avl_mutx);
 	}
 	VTOFD(*vpp)->nlookup++;
 	return (0);
@@ -2021,8 +2330,16 @@ fuse_lookup_i(struct vnode *dvp, char *nm, struct vnode **vpp, cred_t *credp)
 
 				/*
 				 * Convert device special files
+				 * JPA do not do that for fifo's :
+				 * this changes the v_data and the nodeid
+				 * cannot be determined, leading to crashes
+				 * when the inode is needed (e.g. when
+				 * hardlinking another name.
+				 * Moreover the avl_tree should be kept
+				 * in sync with the vnodes in use.
 		 		 */
-				if (IS_DEVVP(*vpp)) {
+				if (((*vpp)->v_type != VFIFO)
+				    && IS_DEVVP(*vpp)) {
 					vnode_t	*svp;
 
 					svp = specvp(*vpp, (*vpp)->v_rdev,
@@ -2127,10 +2444,17 @@ fuse_rmdir(vnode_t *dvp, char *name, vnode_t *cwd, cred_t *credp,
 		goto out;
 	}
 
-	if (vn_vfswlock(vp)) {
-		err = EBUSY;
-		goto out;
-	}
+/*
+ *	JPA This causes directories from other file systems to be locked
+ *	after the current partition is unmounted (reuse of vnode ?)
+ *	On http://wesunsolve.net/bugid/id/6651136 the use of vn_vfsrlock()
+ *	is recommended in a similar situation.
+ *
+ *	if (vn_vfswlock(vp)) {
+ *		err = EBUSY;
+ *		goto out;
+ *	}
+ */
 
 	if (vn_mountedvfs(vp)) {
 		vn_vfsunlock(vp);
@@ -2165,6 +2489,7 @@ sendmsg:
 		 * XXX: This call releases vnode with vn_free, can this
 		 * be an issue? Or does VN_RELE do the required job for us?
 		 */
+		VN_RELE(vp);
 		fuse_vnode_free(vp, sep);
 		vp = NULL;
 	}
@@ -2219,6 +2544,7 @@ fuse_create(struct vnode *dvp, char *nm, struct vattr *vap, vcexcl_t excl,
 {
 	struct fuse_vnode_data *fvdata;
 	uint32_t stringlen;
+	int err;
 
 	if (!nm || *nm == '\0') {
 		DTRACE_PROBE2(fuse_create_err_invalid_name,
@@ -2226,8 +2552,24 @@ fuse_create(struct vnode *dvp, char *nm, struct vattr *vap, vcexcl_t excl,
 		return (EEXIST);
 	}
 
+		/* Check whether the target exists */
+	err = fuse_lookup_i(dvp, nm, vpp, cred_p);
+	if (!err && *vpp) {
+		VN_RELE(*vpp);
+		/* Recreating an existing file without O_EXCL is allowed */
+		if ((vap->va_type == VREG) && !excl)
+			return (0);
+		else
+			return (EEXIST);
+	}
+
 	if (vap->va_type == VDIR) {
 		return (VOP_MKDIR(dvp, nm, vap, vpp, cred_p, ct, 0, va));
+	}
+
+	if (vap->va_type == VFIFO) {
+		return (fuse_mkfifo(dvp, nm, vap, excl, mode, vpp, cred_p,
+				flag, ct, va));
 	}
 
 	if (vap->va_type != VREG) {
@@ -2440,7 +2782,7 @@ fuse_perform_read(struct fuse_io_data *fiodata)
 		fri = (struct fuse_read_in *)msgp->ipdata.indata;
 		fri->fh = fh->fh_id;
 		fri->offset = uiop->uio_offset;
-		fri->size = MIN(uiop->uio_resid,
+		fri->size = MIN((size_t)uiop->uio_resid,
 		    PAGESIZE * FUSE_MAX_PAGES_PER_REQ);
 
 		if ((err = fuse_queue_request_wait(sep, msgp))) {
@@ -2523,8 +2865,6 @@ fuse_readdir(struct vnode *dvp, struct uio *uiop, struct cred *cred_p,
 		return (EIO);
 	}
 
-	fh->ref++;
-
 	/* setup fuse i/o data structure */
 	fiodata.uiop = uiop;
 	fiodata.credp = cred_p;
@@ -2591,11 +2931,18 @@ fuse_path_check(struct vnode *svp, struct vnode *tdvp, struct cred *credp)
 				DTRACE_PROBE2(fuse_path_check_err_parent,
 				    char *, "Parent vnode not found",
 				    struct vnode *, vp);
-				vp = NULL;
 				/*
 				 * XXX: Is this the right error no to return?
+				 * The root directory is not in cache,
+				 * if we reached it and the source is not
+				 * the root directory, there is no error.
 				 */
-				err = EINVAL;
+				if ((VTOFD(vp)->par_nid == FUSE_ROOT_ID)
+				    && (VNODE_TO_NODEID(svp) != FUSE_ROOT_ID))
+					err = 0;
+				else
+					err = EINVAL;
+				vp = NULL;
 				break;
 			} else if (err) {
 				DTRACE_PROBE3(fuse_path_check_err_getvnode,
@@ -2656,6 +3003,14 @@ fuse_rename_i(struct vnode *sdvp, char *oldname, struct vnode *tdvp,
 	(void) memcpy(strptr, newname, new_namelen);
 
 	err = fuse_queue_request_wait(sep, msgp);
+	if (!err) {
+		/* Check for any error from fuse library */
+		if ((err = msgp->opdata.fouth->error) != 0) {
+			DTRACE_PROBE2(fuse_rename_err,
+				char *, "FUSE_RENAME request failed",
+				struct fuse_out_header *, msgp->opdata.fouth);
+		}
+	}
 	fuse_free_msg(msgp);
 	return (err);
 }
@@ -2683,9 +3038,22 @@ fuse_rename(vnode_t *sdvp, char *oldname, vnode_t *tdvp, char *newname,
 {
 	int err = EIO;
 	int samedir;
+	fuse_session_t *sep;
 	struct vnode *svp = NULL;
 	struct vnode *tvp = NULL;
 
+	/*
+	 * Check for renaming to or from '.' or '..'
+	 */
+	if ((oldname[0] == '.' &&
+	    (oldname[1] == '\0' || (oldname[1] == '.' &&
+	    oldname[2] == '\0'))) ||
+	    (newname[0] == '.' &&
+	    (newname[1] == '\0' || (newname[1] == '.' &&
+	    newname[2] == '\0')))) {
+		err = EINVAL;
+		goto errout;
+	}
 
 	/* Try obtaining the source vnode by doing a lookup */
 	err = fuse_lookup_i(sdvp, oldname, &svp, credp);
@@ -2703,16 +3071,7 @@ fuse_rename(vnode_t *sdvp, char *oldname, vnode_t *tdvp, char *newname,
 		goto errout;
 	}
 
-	/*
-	 * Check for renaming to or from '.' or '..'
-	 */
-	if ((oldname[0] == '.' &&
-	    (oldname[1] == '\0' || (oldname[1] == '.' &&
-	    oldname[2] == '\0'))) ||
-	    (newname[0] == '.' &&
-	    (newname[1] == '\0' || (newname[1] == '.' &&
-	    newname[2] == '\0'))) ||
-	    (sdvp == svp)) {
+	if (sdvp == svp) {
 		err = EINVAL;
 		goto errout;
 	}
@@ -2755,13 +3114,65 @@ fuse_rename(vnode_t *sdvp, char *oldname, vnode_t *tdvp, char *newname,
 	if (tvp) {
 		if ((tvp->v_type == VDIR && svp->v_type != VDIR) ||
 		    (tvp->v_type != VDIR && svp->v_type == VDIR)) {
-			err = ENOTDIR;
+			err = (tvp->v_type == VDIR ? EISDIR : ENOTDIR);
 			goto errout;
 		}
 	}
-	/* Inform daemon to handle the rename operation */
-	if ((err = fuse_rename_i(sdvp, oldname, tdvp, newname, credp)))
-		goto errout;
+
+	/* Make sure to have everything ready for renaming */
+	sep = fuse_minor_get_session(getminor(sdvp->v_rdev));
+	if (sep) {
+		fuse_avl_cache_node_t find, *renamep;
+		char *wanted_name = (char*)NULL;
+
+		find.facn_nodeid = VNODE_TO_NODEID(svp);
+		mutex_enter(&sep->avl_mutx);
+		renamep = avl_find(&(sep->avl_cache), &find, NULL);
+		mutex_exit(&sep->avl_mutx);
+		wanted_name = kmem_alloc(strlen(newname) + 1, KM_SLEEP);
+		if (renamep && wanted_name) {
+			/* Inform daemon to handle the rename operation */
+			if ((err = fuse_rename_i(sdvp, oldname, tdvp,
+							newname, credp))) {
+				kmem_free(wanted_name, strlen(newname) + 1);
+				goto errout;
+			} else {
+			/*
+			 * If renaming was successful, the cached entries
+			 * do not match what is stored in the file system
+			 * any more.
+			 * The old target, if any, has been deleted,
+			 * the source has kept its nodeid, but its name
+			 * has changed, so do the same in the cache.
+			 */
+				char *discarded_name;
+				int discarded_namelen;
+
+				if (tvp && (tvp != svp)) {
+					err = fuse_discard_name(tvp, sep);
+				}
+				tvp = (struct vnode*)NULL;
+				mutex_enter(&sep->avl_mutx);
+				avl_remove(&(sep->avl_cache), renamep);
+				discarded_name = renamep->name;
+				discarded_namelen = renamep->namelen;
+				renamep->par_nodeid = VNODE_TO_NODEID(tdvp);
+				renamep->namelen = strlen(newname) + 1;
+				renamep->name = wanted_name;
+				strlcpy(renamep->name, newname,
+							renamep->namelen);
+				avl_add(&(sep->avl_cache), renamep);
+				mutex_exit(&sep->avl_mutx);
+				kmem_free(discarded_name, discarded_namelen);
+			}
+		} else {
+			if (wanted_name)
+				kmem_free(wanted_name, strlen(newname) + 1);
+			err = ENOENT;
+		}
+	} else {
+		err = ENODEV;
+	}
 
 errout:
 	if (svp)
@@ -2869,6 +3280,7 @@ fuse_remove(vnode_t *dvp, char *name, cred_t *credp, caller_context_t *ct,
     int flags)
 {
 	int err;
+	int seen_err;
 	fuse_msg_node_t *msgp;
 	fuse_session_t *sep;
 	int namelen = strlen(name) + 1;
@@ -2882,6 +3294,15 @@ fuse_remove(vnode_t *dvp, char *name, cred_t *credp, caller_context_t *ct,
 		return (ENODEV);
 	}
 
+	/* Check if we have seen and cached the associated vnode */
+	seen_err = fuse_getvnode(FUSE_NULL_ID, &vp, VNODE_CACHED,
+	    0, sep, dvp->v_vfsp, namelen, name, VNODE_TO_NODEID(dvp), credp);
+
+	/* Do not proceed if this is a directory */
+	if (!seen_err && vp && (vp->v_type == VDIR)) {
+		return (EPERM);
+	}
+
 	msgp = fuse_setup_message(namelen, FUSE_UNLINK,
 	    VNODE_TO_NODEID(dvp), credp, FUSE_GET_UNIQUE(sep));
 
@@ -2893,11 +3314,16 @@ fuse_remove(vnode_t *dvp, char *name, cred_t *credp, caller_context_t *ct,
 		goto cleanup;
 	}
 
-	/* Check if we have seen and cached the associated vnode */
-	err = fuse_getvnode(FUSE_NULL_ID, &vp, VNODE_CACHED,
-	    0, sep, dvp->v_vfsp, namelen, name, VNODE_TO_NODEID(dvp), credp);
+	/* Check for any error from fuse library */
+	if ((err = msgp->opdata.fouth->error) != 0) {
+		DTRACE_PROBE2(fuse_unlink_err_unlink_req,
+			char *, "FUSE_UNLINK request failed",
+			struct fuse_out_header *, msgp->opdata.fouth);
+		goto cleanup;
+	}
 
-	if (err) {
+	if (seen_err) {
+		err = seen_err;
 		if (err == ENOENT) {
 			/*
 			 * This means, we don't have this vnode, so
@@ -2921,7 +3347,7 @@ fuse_remove(vnode_t *dvp, char *name, cred_t *credp, caller_context_t *ct,
 	 * XXX: This call releases vnode with vn_free, can this
 	 * be an issue? Or does VN_RELE do the required job for us?
 	 */
-	fuse_vnode_free(vp, sep);
+	err = fuse_discard_name(vp, sep);
 cleanup:
 	fuse_free_msg(msgp);
 	return (err);
@@ -2938,6 +3364,11 @@ fuse_vnode_free(struct vnode *vp, fuse_session_t *sep)
 	struct fuse_vnode_data *fvdatap = VTOFD(vp);
 
 	if (VTOFD(vp)) {
+			/* Invalidate cached pages */
+		if (vn_has_cached_data(vp)) {
+			pvn_vplist_dirty(vp, 0, fuse_putapage,
+					 B_INVAL, sep->usercred);
+		}
 		mutex_enter(&fvdatap->fh_list_lock);
 		for (fhp = list_head(&fvdatap->fh_list); fhp;
 		    fhp = list_next(&fvdatap->fh_list, fhp)) {
@@ -2950,8 +3381,64 @@ fuse_vnode_free(struct vnode *vp, fuse_session_t *sep)
 	}
 	vp->v_data = NULL;
 
-	vn_free(vp);
+	VFS_RELE(vp->v_vfsp);
+	if (!vn_has_cached_data(vp)) /* be safe : better leak than corruption */
+		vn_free(vp);
 }
+
+/*
+ *		Destroy all cached data when unmounting
+ */
+
+void fuse_destroy_cache(fuse_session_t *sep)
+{
+	fuse_avl_cache_node_t *item;
+	int failed;
+
+	mutex_enter(&sep->avl_mutx);
+	item = (fuse_avl_cache_node_t*)avl_first(&(sep->avl_cache));
+	mutex_exit(&sep->avl_mutx);
+	failed = 0;
+	if (item)
+		do {
+			struct vnode *vp = item->facn_vnode_p;
+			struct fuse_fh_param fh_param;
+
+			if (vp && VTOFD(vp)) {
+				/*
+				 * Invalidate pages associated to vnode :
+				 * http://wesunsolve.net/bugid/id/6732672
+				 * http://wesunsolve.net/bugid/id/6730916
+				 */
+				if (vn_has_cached_data(vp)) {
+				/*
+				 * This calls VOP_DISPOSE() for each page
+				 * with flag == 0x10000 and dn == 0
+				 */
+					pvn_vplist_dirty(vp, 0, fuse_putapage,
+						B_INVAL, sep->usercred);
+				}
+				/* Release any file handles */
+				fh_param.vp = vp;
+				fh_param.flag = FUSE_FORCE_FH_RELEASE;
+				iterate_filehandle(vp, fuse_release_fh,
+						&fh_param, NULL);
+				/* Finally remove from our cache */
+				fuse_vnode_cache_remove(vp, sep);
+				fuse_free_vdata(vp);
+				vp->v_data = NULL;
+				VFS_RELE(vp->v_vfsp);
+				if (!vn_has_cached_data(vp))
+	 				vn_free(vp);
+				mutex_enter(&sep->avl_mutx);
+				item = (fuse_avl_cache_node_t*)
+						avl_first(&(sep->avl_cache));
+				mutex_exit(&sep->avl_mutx);
+			} else
+				failed = 1;
+		} while (!failed && item);
+}
+
 /*
  * Insert the indicated symbolic reference entry into the directory.
  *
@@ -2985,6 +3472,13 @@ fuse_symlink(vnode_t *dvp, char *name, vattr_t *vap, char *target,
 		    char *, "failed to find session",
 		    struct vnode *, dvp);
 		return (ENODEV);
+	}
+
+	/* Make sure the target does not exist */
+	err = fuse_lookup_i(dvp, name, &vp, credp);
+	if (!err && vp) {
+		VN_RELE(vp);
+		return (EEXIST);
 	}
 
 	msgp = fuse_setup_message(namelen + targlen, FUSE_SYMLINK,
@@ -3083,6 +3577,59 @@ out:
 }
 
 /*
+ * Create a FIFO
+ *
+ */
+/* ARGSUSED */
+static int
+fuse_mkfifo(struct vnode *dvp, char *name, struct vattr *vap, vcexcl_t excl,
+    int mode, struct vnode **vpp, struct cred *credp, int flag,
+    caller_context_t *ct, vsecattr_t *va)
+{
+	fuse_msg_node_t *msgp;
+	fuse_session_t *sep;
+	struct fuse_mknod_in *fmni;
+	int err = DDI_SUCCESS;
+	int namelen = strlen(name) + 1;
+
+	sep = fuse_minor_get_session(getminor(dvp->v_rdev));
+	if (sep == NULL) {
+		DTRACE_PROBE2(fuse_mkfifo_err_session,
+		    char *, "failed to find session",
+		    struct vnode *, dvp);
+		return (ENODEV);
+	}
+
+	msgp = fuse_setup_message(namelen + sizeof(*fmni), FUSE_MKNOD,
+	    VNODE_TO_NODEID(dvp), credp, FUSE_GET_UNIQUE(sep));
+
+	fmni = (struct fuse_mknod_in*)msgp->ipdata.indata;
+	fmni->mode = (vap->va_mode & ~S_IFMT) | S_IFIFO;
+	fmni->rdev = 0;
+	/* Set up arguments to the fuse library */
+	memcpy((char*)msgp->ipdata.indata + sizeof(*fmni), name, namelen - 1);
+	((char *)msgp->ipdata.indata)[sizeof(*fmni) + namelen - 1] = '\0';
+
+	if ((err = fuse_queue_request_wait(sep, msgp))) {
+		goto cleanup;
+	}
+
+	/* We got woken up, so fuse lib has replied to our release request */
+	if ((err = msgp->opdata.fouth->error) != 0) {
+		DTRACE_PROBE2(fuse_mkfifo_err_mkfifo_req,
+		    char *, "FUSE_MKFIFO request failed",
+		    struct fuse_out_header *, msgp->opdata.fouth);
+		goto cleanup;
+	}
+
+	err = fuse_add_entry(vpp, dvp, msgp, sep, name, namelen, credp, VFIFO);
+
+cleanup:
+	fuse_free_msg(msgp);
+	return (err);
+}
+
+/*
  * Sends the FUSE_FORGET message to daemon which performs the necessary
  * cleanup
  */
@@ -3100,6 +3647,7 @@ fuse_send_forget(uint64_t nodeid, fuse_session_t *sep, uint64_t nlookup)
 	ffi->nlookup = nlookup;
 
 	/* Send the request to the fuse daemon and return */
+	msgp->fmn_noreply = 1;
 	fuse_queue_request_nowait(sep, msgp);
 }
 
@@ -3210,7 +3758,7 @@ fuse_space(vnode_t *vp, int cmd, struct flock64 *bfp, int flag,
 
 			va.va_mask = AT_SIZE;
 			error = VOP_GETATTR(vp, &va, 0, cr, ct);
-			if (error || va.va_size == bfp->l_start) {
+			if (error || va.va_size == (u_offset_t)bfp->l_start) {
 				/*
 				 * do not update ctime/mtime if truncate
 				 * to previous size, just exit
@@ -3377,7 +3925,7 @@ fuse_putpage(struct vnode *vp, offset_t off, size_t len, int flags,
 			return (err);
 		}
 
-		eoff = MIN(off + len, fsize);
+		eoff = MIN((u_offset_t)(off + len), fsize);
 
 		for (io_off = off; io_off < eoff; io_off += io_len) {
 			/*
@@ -3510,11 +4058,14 @@ fuse_vnode_cache_remove(struct vnode *vp, fuse_session_t *sep)
 	fuse_avl_cache_node_t discard, *removep;
 
 	discard.facn_nodeid = VNODE_TO_NODEID(vp);
+	mutex_enter(&sep->avl_mutx);
 	if ((removep = avl_find(& (sep->avl_cache), &discard, &where))
 	    != NULL) {
 		avl_remove(&(sep->avl_cache), removep);
+		mutex_exit(&sep->avl_mutx);
 		fuse_avl_cache_node_destroy(removep);
-	}
+	} else
+		mutex_exit(&sep->avl_mutx);
 }
 
 /* Does all the necessary cleanup w.r.t a vnode */
@@ -3545,6 +4096,7 @@ fuse_inactive(struct vnode *vp, struct cred *credp, caller_context_t *ct)
 {
 	struct fuse_fh_param fh_param;
 	fuse_session_t *sep;
+	int deleted;
 
 	fh_param.vp = vp;
 	fh_param.flag = 0;
@@ -3557,27 +4109,47 @@ fuse_inactive(struct vnode *vp, struct cred *credp, caller_context_t *ct)
 		return;
 	}
 
-	(void) iterate_filehandle(vp, fuse_release_fh, &fh_param, NULL);
+	/*
+	 * The file may have been deleted while if was open,
+	 * if so, remove from cache.
+	 */
+	deleted = 0;
 
-	mutex_enter(&vp->v_lock);
-	if (vp->v_count > 1) {
-		vp->v_count--;
-		mutex_exit(&vp->v_lock);
-		return;
+	if (vp->v_data && (vp->v_type != VDIR)
+	    && !vp->v_rdcnt && !vp->v_wrcnt) {
+		fuse_avl_cache_node_t find, *closep;
+
+		find.facn_nodeid = VNODE_TO_NODEID(vp);
+		mutex_enter(&sep->avl_mutx);
+		closep = avl_find(&(sep->avl_cache), &find, NULL);
+		mutex_exit(&sep->avl_mutx);
+		if (closep && !closep->namelen) {
+			fuse_vnode_free(vp, sep);
+			deleted = 1;
+		}
 	}
-	mutex_exit(&vp->v_lock);
+	if (!deleted && vp->v_data) {
+		(void) iterate_filehandle(vp, fuse_release_fh, &fh_param, NULL);
+		mutex_enter(&vp->v_lock);
+		if (vp->v_count > 1) {
+			vp->v_count--;
+			mutex_exit(&vp->v_lock);
+			return;
+		}
+		mutex_exit(&vp->v_lock);
 #ifndef FLUSH_DATA_ON_VNODE_RELEASE
 
 	/*
 	 * We don't free any pages associated with this vnode, nor do we
 	 * remove it from the AVL tree
 	 */
-	return;
+		return;
 #else
-	if (!(vp->v_flag & VROOT)) {
-		fuse_vnode_destroy(vp, credp, sep);
-	}
+		if (!(vp->v_flag & VROOT)) {
+			fuse_vnode_destroy(vp, credp, sep);
+		}
 #endif
+	}
 }
 
 static int
@@ -3633,6 +4205,7 @@ fuse_mkdir(vnode_t *dvp, char *dirname, vattr_t *vap, vnode_t **vpp,
 	struct fuse_mkdir_in *fmkdi;
 	fuse_msg_node_t *msgp;
 	int err = 0;
+	vnode_t *vp;
 	fuse_session_t *sep;
 	int namelen;
 
@@ -3647,6 +4220,13 @@ fuse_mkdir(vnode_t *dvp, char *dirname, vattr_t *vap, vnode_t **vpp,
 	namelen = strlen(dirname) + 1;
 	if (namelen > MAXNAMELEN) {
 		return (ENAMETOOLONG);
+	}
+
+	/* Make sure the target does not exist */
+	err = fuse_lookup_i(dvp, dirname, &vp, credp);
+	if (!err && vp) {
+		VN_RELE(vp);
+		return (EEXIST);
 	}
 
 	msgp = fuse_setup_message((sizeof (*fmkdi) + namelen),
