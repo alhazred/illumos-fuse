@@ -1,7 +1,7 @@
-illumos-fuse
+illumos-sshfs
 ==================
 
-*Driver for FUSE on illumos (based on OpenSolaris fuse code) + sshfs*
+*Driver for FUSE on illumos (based on OpenSolaris fuse code + patches from jurikm/illumos-fusefs) + sshfs*
 
 build & install
 ===============
